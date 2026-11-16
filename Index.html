@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>語音指令錄音(測試)</title>
+<style>
+  body { font-family: sans-serif; margin: 16px; max-width: 520px; line-height: 1.5; }
+  input, select, button { font-size: 18px; padding: 8px; margin: 4px 0; }
+  input, select { width: 100%; box-sizing: border-box; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
+  .row b { width: 64px; }
+  .row audio { flex: 1; min-width: 160px; height: 36px; }
+  .rec { background: #c62828; color: #fff; border: none; border-radius: 6px; min-width: 88px; }
+  .rec.on { background: #555; }
+  .meta { font-size: 13px; color: #555; width: 100%; }
+  #upload { width: 100%; background: #1565c0; color: #fff; border: none; border-radius: 6px; }
+  #upload:disabled { background: #999; }
+  #status { margin-top: 12px; white-space: pre-wrap; }
+  .err { color: #c62828; }
+  #debug { font-size: 12px; color: #777; margin-top: 16px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h2>語音指令錄音(測試版)</h2>
+<p>(這裡放說明文字)</p>
+
+<label>通關密語</label><input id="pass" autocomplete="off">
+<label>學號</label><input id="sid" autocomplete="off">
+<label>姓名</label><input id="name" autocomplete="off">
+<label>指令</label>
+<select id="cmd">
+  <option value="">請選擇</option>
+  <option>backward</option><option>down</option><option>forward</option>
+  <option>land</option><option>landing</option><option>left</option>
+  <option>right</option><option>takeoff</option><option>up</option>
+</select>
+<p id="hint"></p>
+<div id="takes"></div>
+<button id="upload" disabled>上傳這個指令的 6 筆</button>
+<div id="status"></div>
+<div id="debug"></div>
+
+<script>
+// Apps Script 部署成網頁應用程式之後拿到的網址(結尾是 /exec)
+const ENDPOINT = 'https://script.google.com/macros/s/AKfycbynHORUU-V_gbqS1Vmlaa6rtENOw3KMlz3bwly4c60sQ_TVP9tVtsMlXw36hEwcT4qL/exec';
+
+// ==== DSP BEGIN ====
+// 這一段只用 Math 與 typed array,測試時原樣拿出來在 V8 裡跑。
+function blackmanLowpass(fs, fc, taps) {
+  const h = new Float32Array(taps), m = (taps - 1) / 2;
+  let sum = 0;
+  for (let i = 0; i < taps; i++) {
+    const t = i - m;
+    const sinc = t === 0 ? 2 * fc / fs : Math.sin(2 * Math.PI * fc / fs * t) / (Math.PI * t);
+    const w = 0.42 - 0.5 * Math.cos(2 * Math.PI * i / (taps - 1)) + 0.08 * Math.cos(4 * Math.PI * i / (taps - 1));
+    h[i] = sinc * w;
+    sum += h[i];
+  }
+  for (let i = 0; i < taps; i++) h[i] /= sum;
+  return h;
+}
+
+// 先低通到 7.5 kHz 再內插,不然 8 kHz 以上的聲音會折回 0 到 8 kHz
+function resampleTo(x, from, to) {
+  if (from === to) return Float32Array.from(x);
+  const h = blackmanLowpass(from, 7500, 255), m = (h.length - 1) / 2;
+  const y = new Float32Array(x.length);
+  for (let n = 0; n < x.length; n++) {
+    let acc = 0;
+    const k0 = Math.max(0, n + m - x.length + 1), k1 = Math.min(h.length - 1, n + m);
+    for (let k = k0; k <= k1; k++) acc += h[k] * x[n - k + m];
+    y[n] = acc;
+  }
+  const r = from / to, len = Math.floor(x.length * to / from), out = new Float32Array(len);
+  for (let i = 0; i < len; i++) {
+    const p = i * r, j = Math.floor(p), f = p - j;
+    out[i] = j + 1 < y.length ? y[j] * (1 - f) + y[j + 1] * f : y[j];
+  }
+  return out;
+}
+
+function encodeWav16(x, sr) {
+  const n = x.length, buf = new ArrayBuffer(44 + 2 * n), v = new DataView(buf);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, 'RIFF'); v.setUint32(4, 36 + 2 * n, true); str(8, 'WAVE');
+  str(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, 'data'); v.setUint32(40, 2 * n, true);
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, x[i]));
+    v.setInt16(44 + 2 * i, s < 0 ? Math.round(s * 32768) : Math.round(s * 32767), true);
+  }
+  return buf;
+}
+
+function peakDb(x) {
+  let p = 0;
+  for (let i = 0; i < x.length; i++) p = Math.max(p, Math.abs(x[i]));
+  return p > 0 ? 20 * Math.log10(p) : -Infinity;
+}
+
+function toBase64(buf) {
+  const b = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+// ==== DSP END ====
+
+const TARGET_RATE = 16000, MAX_SECONDS = 3;
+const $ = id => document.getElementById(id);
+let ctx = null, stream = null, source = null, proc = null, chunks = [], active = -1, timer = null;
+let takes = [];
+
+function debug(msg) { $('debug').textContent += msg + '\n'; }
+function status(msg, isErr) { $('status').textContent = msg; $('status').className = isErr ? 'err' : ''; }
+
+function buildRows() {
+  takes = [null, null, null, null, null, null];
+  const box = $('takes');
+  box.innerHTML = '';
+  const cmd = $('cmd').value;
+  $('hint').textContent = cmd ? '請講「' + cmd + '」,每一次都按「錄音」,講完按「停止」(' + MAX_SECONDS + ' 秒會自動停)。' : '';
+  if (!cmd) { refreshUpload(); return; }
+  for (let i = 0; i < 6; i++) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = '<b>第 ' + (i + 1) + ' 次</b><button class="rec" id="rec' + i + '">錄音</button>' +
+                    '<audio id="play' + i + '" controls></audio><span class="meta" id="meta' + i + '"></span>';
+    box.appendChild(row);
+    $('rec' + i).onclick = () => (active === i ? stopRec() : startRec(i));
+  }
+  refreshUpload();
+}
+
+function refreshUpload() {
+  $('upload').disabled = active >= 0 || !$('cmd').value || takes.some(t => !t);
+}
+
+function setButtons() {
+  for (let i = 0; i < 6; i++) {
+    const b = $('rec' + i);
+    if (!b) continue;
+    b.disabled = active >= 0 && active !== i;
+    b.textContent = active === i ? '停止' : (takes[i] ? '重錄' : '錄音');
+    b.className = active === i ? 'rec on' : 'rec';
+  }
+  $('cmd').disabled = active >= 0;
+  refreshUpload();
+}
+
+async function startRec(i) {
+  try {
+    // iOS 要在按鈕的那一下同步建好 AudioContext,await 之後才建會被當成不是使用者操作
+    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (ctx.state === 'suspended') ctx.resume();
+    if (!stream) {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 }
+      });
+      const tr = stream.getAudioTracks()[0];
+      debug('裝置取樣率 ' + ctx.sampleRate + ' Hz;麥克風設定 ' + JSON.stringify(tr.getSettings ? tr.getSettings() : {}));
+    }
+  } catch (e) {
+    status('拿不到麥克風:' + e.name + ' ' + e.message, true);
+    return;
+  }
+  chunks = [];
+  source = ctx.createMediaStreamSource(stream);
+  proc = ctx.createScriptProcessor(4096, 1, 1);
+  proc.onaudioprocess = ev => { if (active >= 0) chunks.push(new Float32Array(ev.inputBuffer.getChannelData(0))); };
+  source.connect(proc);
+  proc.connect(ctx.destination);
+  active = i;
+  status('錄音中…');
+  timer = setTimeout(stopRec, MAX_SECONDS * 1000);
+  setButtons();
+}
+
+function stopRec() {
+  if (active < 0) return;
+  const i = active;
+  active = -1;
+  clearTimeout(timer);
+  proc.disconnect();
+  source.disconnect();
+  let n = 0;
+  chunks.forEach(c => n += c.length);
+  const raw = new Float32Array(n);
+  let o = 0;
+  chunks.forEach(c => { raw.set(c, o); o += c.length; });
+  const t0 = performance.now();
+  const x = resampleTo(raw, ctx.sampleRate, TARGET_RATE);
+  const wav = encodeWav16(x, TARGET_RATE);
+  const pk = peakDb(x);
+  takes[i] = { wav };
+  $('play' + i).src = URL.createObjectURL(new Blob([wav], { type: 'audio/wav' }));
+  $('meta' + i).textContent = (x.length / TARGET_RATE).toFixed(2) + ' 秒,峰值 ' + pk.toFixed(1) + ' dBFS' +
+    (pk > -0.1 ? '(太大聲,請離遠一點重錄)' : pk < -30 ? '(太小聲,請靠近一點重錄)' : '');
+  debug('第 ' + (i + 1) + ' 次:原始 ' + raw.length + ' 點,轉檔 ' + (performance.now() - t0).toFixed(0) + ' ms');
+  status('');
+  setButtons();
+}
+
+// body 是字串、不加任何 header,瀏覽器會當成 text/plain 的簡單請求,不先送 CORS 預檢;
+// Apps Script 不回應預檢,加了 Content-Type: application/json 就會整個被擋。
+async function postTake(body) {
+  const res = await fetch(ENDPOINT, { method: 'POST', body: JSON.stringify(body) });
+  const j = await res.json();
+  if (!j.ok) throw new Error(j.error);
+  return j.saved;
+}
+
+async function upload() {
+  const pass = $('pass').value.trim(), sid = $('sid').value.trim(), name = $('name').value.trim(), cmd = $('cmd').value;
+  if (ENDPOINT.indexOf('https://script.google.com/') !== 0) { status('網頁裡還沒填上傳網址(ENDPOINT)', true); return; }
+  if (!pass) { status('請填通關密語', true); return; }
+  if (!/^[A-Za-z0-9]{4,20}$/.test(sid)) { status('請填學號(英數字)', true); return; }
+  if (!name) { status('請填姓名', true); return; }
+  $('upload').disabled = true;
+  for (let k = 0; k < 6; k++) {
+    const meta = { studentId: sid, name: name, command: cmd, take: k + 1,
+                   deviceRate: ctx ? ctx.sampleRate : 0, savedRate: TARGET_RATE, userAgent: navigator.userAgent };
+    status('上傳第 ' + (k + 1) + ' / 6 筆…');
+    const t0 = performance.now();
+    try {
+      const saved = await postTake({ passcode: pass, meta: meta, wav: toBase64(takes[k].wav) });
+      debug('上傳 ' + saved + ':' + (performance.now() - t0).toFixed(0) + ' ms');
+    } catch (e) {
+      // 跨網域讀不到回應時,檔案其實可能已經存進去了,要去雲端硬碟看
+      status('上傳失敗:' + e.name + ' ' + e.message, true);
+      debug('上傳第 ' + (k + 1) + ' 筆失敗:' + e.name + ' ' + e.message);
+      refreshUpload();
+      return;
+    }
+  }
+  status('「' + cmd + '」6 筆都上傳了。可以換下一個指令。');
+  refreshUpload();
+}
+
+$('cmd').onchange = buildRows;
+$('upload').onclick = upload;
+debug('瀏覽器:' + navigator.userAgent);
+debug('secure context: ' + window.isSecureContext + ';mediaDevices: ' + !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia));
+</script>
+</body>
+</html>
